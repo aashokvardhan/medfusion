@@ -1,31 +1,44 @@
 
 from pathlib import Path
 
+import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from monai.networks.layers import Conv
 from pytorch_msssim import ssim
 from torchvision.utils import save_image
 
-from medical_diffusion.loss.perceivers import LPIPS
+from medical_diffusion.loss.perceivers import LPIPSLoss
 from medical_diffusion.models.model_base import BasicModel
 from medical_diffusion.models.utils.conv_blocks_v2 import *
 
 
-class DiagonalGaussianDistribution(nn.Module):
+class DiagonalGaussianDistribution(object):
+    def __init__(self, parameters, spatial_dims=2):
+        self.parameters = parameters
+        self.spatial_dims = spatial_dims
+        self.mean, self.logvar = torch.chunk(parameters, 2, dim=1)
+        self.logvar = torch.clamp(self.logvar, -30.0, 20.0)
+        self.std = torch.exp(0.5 * self.logvar)
+        self.var = torch.exp(self.logvar)
 
-    def forward(self, x):
-        mean, logvar = torch.chunk(x, 2, dim=1)
-        logvar = torch.clamp(logvar, -30.0, 20.0)
-        std = torch.exp(0.5 * logvar)
-        sample = torch.randn(mean.shape, generator=None, device=x.device)
-        z = mean + std * sample
 
-        batch_size = x.shape[0]
-        var = torch.exp(logvar)
-        kl = 0.5 * torch.sum(torch.pow(mean, 2) + var - 1.0 - logvar)/batch_size
+    def sample(self):
+        x = self.mean + self.std * torch.randn(self.mean.shape).to(device=self.parameters.device)
+        return x
 
-        return z, kl
+    def kl(self, other=None):
+        kl = 0.5 * torch.sum(torch.pow(self.mean, 2) + self.var - 1.0 - self.logvar)
+        return kl
+
+
+    def nll(self, sample, dims=[1,2,3]):
+        logtwopi = np.log(2.0 * np.pi)
+        return 0.5 * torch.sum(
+            logtwopi + self.logvar + torch.pow(sample - self.mean, 2) / self.var,
+            dim=dims)
+
+    def mode(self):
+        return self.mean
 
 
 
@@ -39,7 +52,7 @@ class VAE(BasicModel):
         channel_mul = 64,
         hid_chs =    [ 1, 2,  4, 8],
         embedding_loss_weight=1e-6,
-        perceiver = LPIPS,
+        perceiver = LPIPSLoss,
         perceiver_kwargs = {},
         perceptual_loss_weight = 1.0,
         optimizer=torch.optim.AdamW,
@@ -68,68 +81,57 @@ class VAE(BasicModel):
         ConvBlock = Conv[Conv.CONV, spatial_dims]
 
         # ----------- Encoder ----------------
-        self.encoder = Encoder(ch=channel_mul, ch_mult=hid_chs, num_res_blocks=2, in_channels=in_channels, z_channels= emb_channels)
+        self.encoder = Encoder(ch=channel_mul, ch_mult=hid_chs, num_res_blocks=2, in_channels=in_channels, z_channels= emb_channels, spatial_dims=spatial_dims)
 
         self.quant_conv = ConvBlock(2*emb_channels, 2*emb_channels, 1)
         self.post_quant_conv = ConvBlock(emb_channels, emb_channels, 1)
 
-        # ----------- Reparameterization --------------
-        self.quantizer = DiagonalGaussianDistribution()
-
         # ----------- In-Decoder ------------
-        self.decoder = Decoder(ch=channel_mul, out_ch=out_channels, ch_mult=hid_chs, num_res_blocks=2, dropout=0.0, resamp_with_conv=True, in_channels=emb_channels,z_channels=emb_channels)
+        self.decoder = Decoder(ch=channel_mul, out_ch=out_channels, ch_mult=hid_chs, num_res_blocks=2, dropout=0.0, resamp_with_conv=True, in_channels=emb_channels,z_channels=emb_channels, spatial_dims=spatial_dims)
 
     def encode(self, x):
         h = self.encoder(x)
-        z = self.quant_conv(h)
-        z, _ = self.quantizer(z)
-        return z
+        moments = self.quant_conv(h)
+        posterior = DiagonalGaussianDistribution(moments)
+        return posterior
 
     def decode(self, z):
         h = self.post_quant_conv(z)
         dec = self.decoder(h)
         return dec
 
-    def forward(self, x_in):
+    def forward(self, x_in, sample_posterior=True):
         # --------- Encoder --------------
-        h = self.encoder(x_in)
-        z = self.quant_conv(h)
+        posterior = self.encode(x_in)
 
         # --------- Quantizer --------------
-        z_q, emb_loss = self.quantizer(z)
+        if sample_posterior:
+            z = posterior.sample()
 
-        # -------- Decoder -----------
-        h = self.post_quant_conv(z)
-        dec = self.decoder(h)
+        else:
+            z = posterior.mode()
 
-        return dec, emb_loss
+        dec = self.decode(z)
+        return dec, posterior
 
-    def perception_loss(self, pred, target, depth=0):
-        if (self.perceiver is not None) and (depth<2):
+    def perception_loss(self, pred, target):
+        if (self.perceiver is not None):
             self.perceiver.eval()
             return self.perceiver(pred, target)*self.perceptual_loss_weight
         else:
             return 0
 
     def ssim_loss(self, pred, target):
-        return 1-ssim(((pred+1)/2).clamp(0,1), (target.type(pred.dtype)+1)/2, data_range=1, size_average=False,
-                        nonnegative_ssim=True).reshape(-1, *[1]*(pred.ndim-1))
+        return 1-ssim(((pred+1)/2).clamp(0,1), (target.type(pred.dtype)+1)/2, data_range=1, size_average=False, nonnegative_ssim=True).reshape(-1, *[1]*(pred.ndim-1))
 
-    def rec_loss(self, pred, pred_vertical, target):
+    def rec_loss(self, pred, target):
         interpolation_mode = 'nearest-exact'
 
         # Loss
         loss = 0
-        rec_loss = self.loss_fct(pred, target)+self.perception_loss(pred, target)+self.ssim_loss(pred, target)
+        rec_loss = torch.sum(self.loss_fct(pred.contiguous(), target.contiguous())) + self.perception_loss(pred.contiguous(), target.contiguous()) + self.ssim_loss(pred.contiguous(), target.contiguous())
         # rec_loss = rec_loss/ torch.exp(self.logvar) + self.logvar # Note this is include in Stable-Diffusion but logvar is not used in optimizer
         loss += torch.sum(rec_loss)/pred.shape[0]
-
-
-        for i, pred_i in enumerate(pred_vertical):
-            target_i = F.interpolate(target, size=pred_i.shape[2:], mode=interpolation_mode, align_corners=None)
-            rec_loss_i = self.loss_fct(pred_i, target_i)+self.perception_loss(pred_i, target_i)+self.ssim_loss(pred_i, target_i)
-            # rec_loss_i = rec_loss_i/ torch.exp(self.logvar_ver[i]) + self.logvar_ver[i]
-            loss += torch.sum(rec_loss_i)/pred.shape[0]
 
         return loss
 
@@ -139,10 +141,12 @@ class VAE(BasicModel):
         target = x
 
         # ------------------------- Run Model ---------------------------
-        pred, pred_vertical, emb_loss = self(x)
+        pred, posterior = self(x)
+
 
         # ------------------------- Compute Loss ---------------------------
-        loss = self.rec_loss(pred, pred_vertical, target)
+        loss = self.rec_loss(pred, target)
+        emb_loss = posterior.kl()
         loss += emb_loss*self.embedding_loss_weight
 
         # --------------------- Compute Metrics  -------------------------------
@@ -150,8 +154,7 @@ class VAE(BasicModel):
             logging_dict = {'loss':loss, 'emb_loss': emb_loss}
             logging_dict['L2'] = torch.nn.functional.mse_loss(pred, target)
             logging_dict['L1'] = torch.nn.functional.l1_loss(pred, target)
-            logging_dict['ssim'] = ssim((pred+1)/2, (target.type(pred.dtype)+1)/2, data_range=1)
-            # logging_dict['logvar'] = self.logvar
+            #logging_dict['ssim'] = ssim((pred+1)/2, (target.type(pred.dtype)+1)/2, data_range=1)
 
         # ----------------- Log Scalars ----------------------
         for metric_name, metric_val in logging_dict.items():

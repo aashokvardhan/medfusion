@@ -143,7 +143,6 @@ class Encoder(nn.Module):
         self.down = nn.ModuleList()
         for i_level in range(self.num_resolutions):
             block = nn.ModuleList()
-            attn = nn.ModuleList()
             block_in = ch*in_ch_mult[i_level]
             block_out = ch*ch_mult[i_level]
             for i_block in range(self.num_res_blocks):
@@ -155,7 +154,6 @@ class Encoder(nn.Module):
                 block_in = block_out
             down = nn.Module()
             down.block = block
-            down.attn = attn
             if i_level != self.num_resolutions-1:
                 down.downsample = Downsample(block_in, resamp_with_conv, spatial_dims=spatial_dims)
             self.down.append(down)
@@ -190,8 +188,6 @@ class Encoder(nn.Module):
         for i_level in range(self.num_resolutions):
             for i_block in range(self.num_res_blocks):
                 h = self.down[i_level].block[i_block](hs[-1], temb)
-                if len(self.down[i_level].attn) > 0:
-                    h = self.down[i_level].attn[i_block](h)
                 hs.append(h)
             if i_level != self.num_resolutions-1:
                 hs.append(self.down[i_level].downsample(hs[-1]))
@@ -246,7 +242,6 @@ class Decoder(nn.Module):
         self.up = nn.ModuleList()
         for i_level in reversed(range(self.num_resolutions)):
             block = nn.ModuleList()
-            attn = nn.ModuleList()
             block_out = ch*ch_mult[i_level]
             for i_block in range(self.num_res_blocks+1):
                 block.append(ResnetBlock(in_channels=block_in,
@@ -257,7 +252,6 @@ class Decoder(nn.Module):
                 block_in = block_out
             up = nn.Module()
             up.block = block
-            up.attn = attn
             if i_level != 0:
                 up.upsample = Upsample(block_in, resamp_with_conv, spatial_dims=spatial_dims)
             self.up.insert(0, up) # prepend to get consistent order
@@ -285,8 +279,6 @@ class Decoder(nn.Module):
         for i_level in reversed(range(self.num_resolutions)):
             for i_block in range(self.num_res_blocks+1):
                 h = self.up[i_level].block[i_block](h, temb)
-                if len(self.up[i_level].attn) > 0:
-                    h = self.up[i_level].attn[i_block](h)
             if i_level != 0:
                 h = self.up[i_level].upsample(h)
 
