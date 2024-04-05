@@ -1,8 +1,9 @@
-import math 
-import torch 
-import torch.nn as nn 
+import math
 
+import torch
+import torch.nn as nn
 from monai.networks.layers.utils import get_act_layer
+
 
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, emb_dim=16, downscale_freq_shift=1, max_period=10000, flip_sin_to_cos=False):
@@ -22,7 +23,7 @@ class SinusoidalPosEmb(nn.Module):
 
         if self.flip_sin_to_cos:
             emb = torch.cat([emb[:, half_dim:], emb[:, :half_dim]], dim=-1)
-        
+
         if self.emb_dim % 2 == 1:
             emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
         return emb
@@ -51,18 +52,18 @@ class LearnedSinusoidalPosEmb(nn.Module):
 
 class TimeEmbbeding(nn.Module):
     def __init__(
-            self, 
-            emb_dim = 64,  
+            self,
+            emb_dim = 64,
             pos_embedder = SinusoidalPosEmb,
             pos_embedder_kwargs = {},
-            act_name=("SWISH", {}) # Swish = SiLU 
+            act_name=("SWISH", {}) # Swish = SiLU
         ):
         super().__init__()
         self.emb_dim = emb_dim
         self.pos_emb_dim =  pos_embedder_kwargs.get('emb_dim', emb_dim//4)
         pos_embedder_kwargs['emb_dim'] = self.pos_emb_dim
         self.pos_embedder = pos_embedder(**pos_embedder_kwargs)
-        
+
 
         self.time_emb = nn.Sequential(
             self.pos_embedder,
@@ -70,6 +71,6 @@ class TimeEmbbeding(nn.Module):
             get_act_layer(act_name),
             nn.Linear(self.emb_dim, self.emb_dim)
         )
-    
+
     def forward(self, time):
         return self.time_emb(time)
