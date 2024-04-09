@@ -1,16 +1,14 @@
-
-
 from pathlib import Path
+from tqdm import tqdm
 
 import torch
 import torch.nn.functional as F
 from torchvision.utils import save_image
-from tqdm import tqdm
-
 import streamlit as st
+
 from medical_diffusion.models import BasicModel
-from medical_diffusion.utils.math_utils import kl_gaussians
 from medical_diffusion.utils.train_utils import EMAModel
+from medical_diffusion.utils.math_utils import kl_gaussians
 
 
 class DiffusionPipeline(BasicModel):
@@ -70,6 +68,7 @@ class DiffusionPipeline(BasicModel):
             self.ema_model = EMAModel(self.noise_estimator, **ema_kwargs)
 
 
+
     def _step(self, batch: dict, batch_idx: int, state: str, step: int, optimizer_idx:int):
         results = {}
         x_0 = batch['source']
@@ -97,7 +96,7 @@ class DiffusionPipeline(BasicModel):
             noise_estimator = self.noise_estimator
 
         # Re-estimate x_T or x_0, self-conditioned on previous estimate
-        self_cond = None
+        '''self_cond = None
         if self.use_self_conditioning:
             with torch.no_grad():
                 pred, pred_vertical = noise_estimator(x_t, t, condition, None)
@@ -112,10 +111,10 @@ class DiffusionPipeline(BasicModel):
 
         # Classifier free guidance
         if torch.rand(1)<self.classifier_free_guidance_dropout:
-            condition = None
+            condition = None '''
 
         # Run Denoise
-        pred, pred_vertical = noise_estimator(x_t, t, condition, self_cond)
+        pred = noise_estimator(x_t, t, condition)
 
         # Separate variance (scale) if it was learned
         if self.estimate_variance:
@@ -133,12 +132,9 @@ class DiffusionPipeline(BasicModel):
         # ------------------------- Compute Loss ---------------------------
         interpolation_mode = 'area'
         loss = 0
-        weights = [1/2**i for i in range(1+len(pred_vertical))] # horizontal (equal) + vertical (reducing with every step down)
-        tot_weight = sum(weights)
-        weights = [w/tot_weight for w in weights]
 
         # ----------------- MSE/L1, ... ----------------------
-        loss += self.loss_fct(pred, target)*weights[0]
+        loss += self.loss_fct(pred, target)
 
         # ----------------- Variance Loss --------------
         if self.estimate_variance:
@@ -167,11 +163,6 @@ class DiffusionPipeline(BasicModel):
             results['variance_scale'] = torch.mean(var_scale)
             results['variance_loss'] = var_loss
 
-
-        # ----------------------------- Deep Supervision -------------------------
-        for i, pred_i in enumerate(pred_vertical):
-            target_i = F.interpolate(target, size=pred_i.shape[2:], mode=interpolation_mode, align_corners=None)
-            loss += self.loss_fct(pred_i, target_i)*weights[i+1]
         results['loss']  = loss
 
 
@@ -180,7 +171,7 @@ class DiffusionPipeline(BasicModel):
         with torch.no_grad():
             results['L2'] = F.mse_loss(pred, target)
             results['L1'] = F.l1_loss(pred, target)
-
+            # results['SSIM'] = SSIMMetric(data_range=pred.max()-pred.min(), spatial_dims=source.ndim-2)(pred, target)
 
         # ----------------- Log Scalars ----------------------
         for metric_name, metric_val in results.items():
@@ -197,7 +188,6 @@ class DiffusionPipeline(BasicModel):
             sample_img = self.sample(num_samples=self.num_samples, img_size=x_0.shape[1:], condition=sample_cond).detach()
 
             log_step = self.global_step // self.sample_every_n_steps
-
             path_out = Path(self.logger.log_dir)/'images'
             path_out.mkdir(parents=True, exist_ok=True)
             # for 3D images use depth as batch :[D, C, H, W], never show more than 32 images
@@ -229,7 +219,7 @@ class DiffusionPipeline(BasicModel):
                 pred_cond,   pred_var_cond =  pred_cond.chunk(2, dim = 1)
                 pred_var = pred_var_uncond + guidance_scale * (pred_var_cond - pred_var_uncond)
         else:
-            pred, _ =  noise_estimator(x_t, t, condition=condition, self_cond=self_cond)
+            pred =  noise_estimator(x_t, t, condition=condition, self_cond=self_cond)
             if self.estimate_variance:
                 pred, pred_var =  pred.chunk(2, dim = 1)
 
@@ -239,8 +229,6 @@ class DiffusionPipeline(BasicModel):
         else:
             pred_var_scale = 0
             pred_var_value = None
-
-        # pred_var_scale = pred_var_scale.clamp(0, 1)
 
         if  self.estimator_objective == 'x_0':
             x_t_prior, x_0 = self.noise_scheduler.estimate_x_t_prior_from_x_0(x_t, t, pred, clip_x0=self.clip_x0, var_scale=pred_var_scale, cold_diffusion=cold_diffusion)
