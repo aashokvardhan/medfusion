@@ -508,9 +508,7 @@ class UNetModel(nn.Module):
         dims=2,
         num_classes=None,
         use_scale_shift_norm=False,
-        resblock_updown=False,
-        n_embed=None,                     # custom support for prediction of discrete ids into codebook of first stage vq model
-    ):
+        resblock_updown=False, **kwargs):
         super().__init__()
         self.in_channels = in_channels
         self.model_channels = model_channels
@@ -520,7 +518,6 @@ class UNetModel(nn.Module):
         self.channel_mult = channel_mult
         self.conv_resample = conv_resample
         self.num_classes = num_classes
-        self.predict_codebook_ids = n_embed is not None
 
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
@@ -641,7 +638,7 @@ class UNetModel(nn.Module):
             zero_module(conv_nd(dims, model_channels, out_channels, 3, padding=1)),
         )
 
-    def forward(self, x, timesteps=None, y=None,**kwargs):
+    def forward(self, x, t=None, condition=None,**kwargs):
         """
         Apply the model to an input batch.
         :param x: an [N x C x ...] Tensor of inputs.
@@ -649,15 +646,15 @@ class UNetModel(nn.Module):
         :param y: an [N] Tensor of labels, if class-conditional.
         :return: an [N x C x ...] Tensor of outputs.
         """
-        assert (y is not None) == (
+        assert (condition is not None) == (
             self.num_classes is not None
         ), "must specify y if and only if the model is class-conditional"
         hs = []
-        t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
+        t_emb = timestep_embedding(t, self.model_channels, repeat_only=False)
         emb = self.time_embed(t_emb)
 
         if self.num_classes is not None:
-            emb = emb + self.label_emb(y)
+            emb = emb + self.label_emb(condition)
 
         h = x
         for module in self.input_blocks:
